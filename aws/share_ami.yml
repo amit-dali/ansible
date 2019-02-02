@@ -1,0 +1,140 @@
+---
+- name: Find and hold details of source AMI to propagate
+  ec2_ami_facts:
+    image_ids: "{{ source_ami }}"
+    region: "{{ aws.region }}"
+  register: ami_facts
+
+- name: Copy snap shot
+  ec2_snapshot_copy:
+    source_region: "{{ aws.region }}"
+    region: "{{ aws.region }}"
+    source_snapshot_id: "{{ ami_facts.images[0].block_device_mappings[0].ebs.snapshot_id }}"
+    encrypted: yes
+    kms_key_id: "{{ source_kms_key_id }}"
+    wait: yes
+    tags:
+      Name: "{{ source_ami }}"
+  register: source_new_snapshot
+
+- name: Share snapshot to another aws account
+  shell: |
+    aws ec2 modify-snapshot-attribute --no-verify-ssl --region {{ aws.region }} --snapshot-id {{ source_new_snapshot.snapshot_id }} --attribute createVolumePermission --operation-type add --user-ids {{ target_account }}
+  args:
+    executable: /bin/bash
+
+- name: Assume role of target account
+  sts_assume_role:
+    role_arn: "{{ target_account_role }}"
+    role_session_name: "{{ role_session_name }}"
+    region: "{{ aws.region }}"
+  register: assumed_role
+
+- name: Copy snapshot from source aws account to target aws account
+  ec2_snapshot_copy:
+    source_region: "{{ aws.region }}"
+    region: "{{ aws.region }}"
+    source_snapshot_id: "{{ source_new_snapshot.snapshot_id  }}"
+    encrypted: yes
+    kms_key_id: "{{ target_kms_key_id }}"
+    aws_access_key: "{{ assumed_role.sts_creds.access_key }}"
+    aws_secret_key: "{{ assumed_role.sts_creds.secret_key }}"
+    security_token: "{{ assumed_role.sts_creds.session_token }}"
+    wait: yes
+  register: target_new_snapshot
+
+- name: Create new volume using new snapshot
+  shell: |
+    export AWS_ACCESS_KEY_ID="{{ assumed_role.sts_creds.access_key }}"
+    export AWS_SECRET_ACCESS_KEY="{{ assumed_role.sts_creds.secret_key }}"
+    export AWS_SECURITY_TOKEN="{{ assumed_role.sts_creds.session_token }}"
+    target_volume_id=$(aws ec2 create-volume \
+        --region '{{ aws.region }}' \
+        --snapshot-id '{{ target_new_snapshot.snapshot_id }}' \
+        --availability-zone '{{ aws.availability_zone }}' \
+        --volume-type 'gp2' |  jq -r '.VolumeId')
+    aws ec2 wait volume-available --volume-ids '$target_volume_id'
+  args:
+    executable: /bin/bash
+  register: target_new_volume
+
+- set_fact:
+    target_new_volume_id: "{{ target_new_volume.stdout_lines[0] }}"
+
+- name: Select the subnet_id for the target aws account
+  ec2_vpc_subnet_facts:
+    aws_access_key: "{{ assumed_role.sts_creds.access_key }}"
+    aws_secret_key: "{{ assumed_role.sts_creds.secret_key }}"
+    security_token: "{{ assumed_role.sts_creds.session_token }}"
+    region: "{{ aws.region }}"
+    filters:
+      "tag:Name": "subnet-one"
+      availabilityZone: "{{aws.availability_zone}}"
+      tag-key: Name
+      state : available
+  register: subnet_facts
+
+- set_fact:
+    subnet_id: "{{ subnet_facts.subnets|map(attribute='id')|list|first }}"
+
+- name: Find latest base AMI
+  ec2_ami_facts:
+    aws_access_key: "{{ assumed_role.sts_creds.access_key }}"
+    aws_secret_key: "{{ assumed_role.sts_creds.secret_key }}"
+    security_token: "{{ assumed_role.sts_creds.session_token }}"
+    owners: "{{ target_account }}"
+    region: "{{ aws.region }}"
+    filters:
+      architecture: "x86_64"
+      name: "{{ os_name_filter }}"
+      state: "available"
+      virtualization-type: "hvm"
+      image-type: "machine"
+  register: amis
+
+- set_fact:
+    sorted_amis: "{{ amis.images | sort(attribute='creation_date') }}"
+
+- set_fact:
+    marketplace_image: "{{ sorted_amis | last }}"
+
+- name: Provisioning AWS EC2 instance
+  shell: |
+    export AWS_ACCESS_KEY_ID="{{ assumed_role.sts_creds.access_key }}"
+    export AWS_SECRET_ACCESS_KEY="{{ assumed_role.sts_creds.secret_key }}"
+    export AWS_SECURITY_TOKEN="{{ assumed_role.sts_creds.session_token }}"
+    instance_id=`aws ec2 run-instances \
+     --region '{{ aws.region }}' \
+     --image-id '{{ marketplace_image.image_id }}' \
+     --subnet-id '{{ subnet_id }}' \
+     --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"DeleteOnTermination\":true}}]" \
+     --instance-type 't2.medium' \
+     --placement 'AvailabilityZone={{ aws.availability_zone }}' \
+     --tag-specifications "ResourceType=instance,Tags=[{Key=propagation,Value=true},{Key=Name,Value=temporary-instance}]" \
+     --query 'Instances[0].InstanceId' \
+     --output text`
+    aws ec2 wait instance-running --region '{{ aws.region }}' --instance-ids "$instance_id"
+    aws ec2 stop-instances --region '{{ aws.region }}' --force --instance-ids "$instance_id"
+    aws ec2 wait instance-stopped --region '{{ aws.region }}' --instance-ids "$instance_id"
+  args:
+    executable: /bin/bash
+  register: ec2_inst
+
+- set_fact:
+    ec2_inst_id: "{{ ec2_inst.stdout_lines[0]}}"
+
+- name: Get volume, remove it and atatch new volume
+  shell: |
+    export AWS_ACCESS_KEY_ID="{{ assumed_role.sts_creds.access_key }}"
+    export AWS_SECRET_ACCESS_KEY="{{ assumed_role.sts_creds.secret_key }}"
+    export AWS_DEFAULT_REGION="{{ aws.region }}"
+    export AWS_SECURITY_TOKEN="{{ assumed_role.sts_creds.session_token }}"
+    defunct_volume_id=`aws ec2 describe-volumes --filters \
+    	Name=attachment.instance-id,Values={{ ec2_inst_id }} \
+    	--region '{{ aws.region }}' \
+    	--query 'Volumes[0].VolumeId' \
+    	--output text`
+    aws ec2 detach-volume --volume-id "$defunct_volume_id" --region '{{ aws.region }}'
+    aws ec2 attach-volume --volume-id "{{ target_new_volume_id }}" --instance-id "{{ ec2_inst_id }}" --device /dev/sda1 --region '{{ aws.region }}'
+  args:
+    executable: /bin/bash
