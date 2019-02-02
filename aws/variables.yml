@@ -1,0 +1,13 @@
+---
+source_ami: "{{ source_ami }}"
+source_kms_key_id: "{{ source_kms_key_id }}"
+target_kms_key_id: "{{ target_kms_key_id }}"
+root_device: /dev/sda1
+target_account: "{{ target_account }}"
+target_account_role: "{{ target_account_role }}"
+role_session_name: "{{ role_session_name }}"
+os_name_filter: "{{ os_name_filter }}"
+
+aws:
+  region: us-west-1
+  availability_zone: us-west-1a
